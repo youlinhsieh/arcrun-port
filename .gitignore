@@ -1,0 +1,24 @@
+node_modules/
+
+# ── 編譯產物不進版控（D95，2026-08-18）────────────────────────────────────
+# 這個 repo（GitHub 對外那一份）的來源是 arcrun-rag 的 collector/；當初抽出來時，歷史裡有 46 個 >1MB 的編譯產物
+# （arcrun-tray 的 .app、各版 dmg、下載回來的 WebView2 安裝檔…），總計 626 MB。
+# 抽取時已把它們從歷史裡剔除 ⇒ 這個 repo 全部歷史只剩 8 MB。
+#
+# 🔴 這一份清單是「不要再長回來」的那道閘：出貨線每次把 arcrun-rag 的 collector/
+#   同步過來時，`git add -A` 會照這份跳過它們（見 installer/scripts/line-source-repo.mjs）。
+#   ⚠️ arcrun-rag 那邊**現在還追蹤著這四個檔**——不在這一輪拿掉，是因為
+#   `daemon-version.py --source-state` 的指紋把它們算在內，改動會讓 daemon-freshness
+#   那道閘擋下出貨。拆它要跟戳版帳本一起處理，另立一輪（票：inkstone/InkStoneCo#40）
+# 📌 2026-08-24：GitHub 這一側改名為 arcrun-port（leo：「它是 Arcrun 雲端和地端的接口，
+#   用途不只是收集器」）。Gitea 那側仍是 arcrun-collector，是已知的不一致。。
+collector
+cmd/arcrun-app/arcrun-app
+cmd/arcrun-app/dist/
+cmd/arcrun-app/dist-msix/
+cmd/arcrun-app/build/bin/
+cmd/arcrun-app/build/windows/installer/tmp/
+cmd/arcrun-app/frontend/dist/
+cmd/arcrun-app/frontend/node_modules/
+cmd/arcrun-app/frontend/wailsjs/
+cmd/**/*.app
