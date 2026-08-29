@@ -114,6 +114,12 @@ type DirectConfig struct {
 	// 所以改名不會讓庫裡憑空多出一台機器。
 	MachineLabel string `json:"machine_label,omitempty"`
 
+	// guard＝這一輪的「等待閘」（見 stallguard.go）。RunDirectOnce 每輪換一份新的；
+	// makeAccountSubConfig 的 `sub := *c` 會把這個**指標**一起帶過去，所以同一輪的
+	// 所有帳號、所有資料夾共用同一份紀錄——斷路器要跨得了資料夾才擋得住「一發卡住
+	// 就整輪停擺」。不落 config 檔（它是這一次執行的狀態，不是使用者設定）。
+	guard *roundGuard
+
 	// machine＝解析好的機器身分快取（不落 config 檔：ID 的家是 machine.json，
 	// 這裡只是這一輪的記憶體副本。makeAccountSubConfig 的 `sub := *c` 會一起複製，
 	// 所以多帳號同一輪只解析一次、每個帳號送出的值必然一致）。
@@ -467,7 +473,11 @@ func (c *DirectConfig) migrateManifestIfNeeded(absRoot, newPath string) {
 	}
 }
 
-// directHTTP 是 direct 模式共用的 HTTP client（萃取 workflow 可能同步跑 LLM，放寬 timeout）。
+// directHTTP 是 direct 模式共用的 HTTP client。
+//
+// 🔴 這把 Timeout 是**最後一道**保險，不是每一發的上限（`inkstone/arcrun-rag#153`）：
+// 真正生效的上限由呼叫端的 callStep 帶進 context（見 stallguard.go），因為
+// 「送一份筆記」跟「請雲端同步跑完 AI 萃取」本來就不該共用同一個數字。
 var directHTTP = &http.Client{Timeout: 300 * time.Second}
 
 // triggerURL 組出 named-webhook 觸發完整 URL。
@@ -505,12 +515,23 @@ func countsAsDocument(r DirectResult) bool {
 }
 
 // postJSON POST 一個 JSON body 到 url，回傳 HTTP 狀態碼與回應片段。非 2xx 視為錯誤。
-func (c *DirectConfig) postJSON(url string, body any) (int, string, error) {
+//
+// step 講的是「這一發在做什麼」（`inkstone/arcrun-rag#153`）：它決定這一發自己的
+// 上限，也決定卡住時畫面與日誌上那句話怎麼寫。同一個網址在不同地方是不同的事
+//（收卡那條路，可能是使用者剛存的新檔，也可能是在補修舊筆記的出處）——
+// 所以 step 由呼叫端給，不從網址反推，反推出來的名字會說謊。
+func (c *DirectConfig) postJSON(step callStep, url string, body any) (int, string, error) {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return 0, "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(data))
+	gate := c.openGate(step)
+	defer gate.release() // context 要活到下面讀完回應為止，所以是 defer 不是就地釋放
+	// 這一輪已經判定這個帳號沒有回應 ⇒ 連打都不打，立刻回頭讓其他資料夾繼續。
+	if note := gate.blocked(); note != "" {
+		return 0, "", errors.New(note)
+	}
+	req, err := http.NewRequestWithContext(gate.ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
 		return 0, "", err
 	}
@@ -518,8 +539,9 @@ func (c *DirectConfig) postJSON(url string, body any) (int, string, error) {
 	req.Header.Set("X-Arcrun-API-Key", c.APIKey)
 	resp, err := directHTTP.Do(req)
 	if err != nil {
-		return 0, "", err
+		return 0, "", gate.record(err)
 	}
+	gate.ok() // #153：回來了就把「連續逾時」的計數歸零——否則「連續」兩個字是假的
 	defer resp.Body.Close()
 	// 🔴 讀 64KB 而不是 1KB：觸發端點的回應是一層外殼包著工作流的輸出，
 	// 而**失敗的證據住在殼裡面**（見 triggeroutcome.go）。1KB 會把 JSON 切斷 ⇒
@@ -610,6 +632,12 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 	exit := 0
 	var lastPayload *TriggerPayload
 	now := time.Now() // 2026-08-07 pacing task：整輪共用同一個時間點（排序/冷卻判斷一致、好測試）
+
+	// 🔴 `inkstone/arcrun-rag#153`：這一輪的「等待閘」。每輪換一份新的——斷路器只管
+	// 這一輪，下一輪一律從零開始重新試（同步是 level-triggered 的，沒有什麼要記住）。
+	// 指標會隨 makeAccountSubConfig 的 `sub := *c` 傳給每個帳號、每個資料夾，
+	// 所以「這個帳號沒有回應」這件事跨得了資料夾——那正是本票要修的那條線。
+	cfg.guard = newRoundGuard()
 
 	// 2026-08-07：提早載入上一輪 status（原本只在函式尾端載入做 CarryForwardActivity）。
 	// 額度冷卻與「今天已萃幾份」是**跨輪持續的狀態**（quotaState 見 quota.go），
@@ -714,6 +742,10 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 	folderTrees := map[string]FolderTree{}
 	var knownRoots []string
 
+	// `inkstone/arcrun-rag#159`：每個看守資料夾這一輪的同步現況（key＝資料夾路徑）。
+	// 值是 (*Manifest).Progress() 的原件——與 totalProgress 同一個來源，只是沒有累加。
+	folderProgress := map[string]SyncProgress{}
+
 	// t210：跨帳號、跨資料夾累加的總量進度（見 rootProgress 註解）。
 	var totalProgress SyncProgress
 	var stuckReasons []string
@@ -740,8 +772,28 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 
 		// t103：per-account 雲端版本偵測
 		cloudVer, cloudOK := fetchCloudVersion(accCfg.CypherURL)
+		// 🔴 `inkstone/arcrun-rag#159`：**一次探測失敗 ≠ 這台知識庫連不上。**
+		//
+		// leo 2026-08-28 的畫面上，`youlin.hsieh.dev` 那行紅字寫「目前連不上這個
+		// 知識庫，查不到版本」——而同一台機器上 curl 打同一支 /health 是 HTTP 200
+		// 亞秒回應。實查當下 status.json：**三個帳號全部** `cloud_check_ok=false`、
+		// 錯誤都是 `dial tcp: ... no such host`，而剛開的 Go 行程（cgo 與純 Go
+		// 兩種 resolver 都試過）解得出來、GET 也 200。
+		// ⇒ 那是這台機器當下的 DNS 抽風，不是知識庫掛了。
+		//
+		// 舊寫法把「這一輪沒查到」直接呈現成「查不到版本」，於是**一次抽風就抹掉
+		// 我們早就知道的事實**。改成：查不到就沿用上一輪查到的版本
+		//（同 CarryForwardActivity 的理由），只有**從來沒查到過**才是真的不知道。
+		// CloudCheckOK 仍照實記這一輪的可達性——那是另一件事，不混在一起。
+		if strings.TrimSpace(cloudVer) == "" {
+			if prevAcc, ok := prevStatus.AccountDetails[accHost]; ok {
+				cloudVer = prevAcc.CloudVersion
+			}
+		}
 		// t215：這個帳號要不要更新——與 portal 版本卡同一套判準（見檔頭）。
-		cloudUpd := EvalCloudUpdate(cloudVer, cloudOK, latestRelease, latestOK)
+		// 第二個參數傳「我們知不知道它的版本」而不是「這一輪連不連得上」：
+		// 版本是**事實**，可達性是**當下狀態**，兩者不是同一個問題。
+		cloudUpd := EvalCloudUpdate(cloudVer, strings.TrimSpace(cloudVer) != "", latestRelease, latestOK)
 		accSt := AccountSyncStatus{
 			LastSync:         time.Now().Format(time.RFC3339),
 			CloudVersion:     cloudVer,
@@ -757,7 +809,7 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 		// 更新進度不同步），一個帳號通了不代表另一個也通。
 		// 只在走 workers-ai 這條路時掃；選了 Gemini 的人不需要知道這件事。
 		if accCfg.Extractor == "workers-ai" {
-			state := ProbeWorkersAI(accCfg.CypherURL, accCfg.APIKey)
+			state := accCfg.probeWorkersAI()
 			accSt.CloudAIReady = state.Ready
 			accSt.CloudAINote = state.Note
 			if !state.Ready && state.Note != "" {
@@ -833,6 +885,10 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 				skippedOtherNames = append(skippedOtherNames, p.SkippedOtherNames...)
 				// #104：這一根用了什麼策略、少收了什麼 —— 以前到這裡就被丟掉了
 				// （只有 CLI 的 stderr 講得出來，App 走的這條路一個字都不說）。
+				// #159：這一根的同步現況。與 folderPlans 同一個「掃成了才記」的閘——
+				// 掃壞的那輪 rootProgress 是零值，記下去畫面會把它讀成「0 份、已同步」
+				// ＝拿我們自己編的答案打勾。沒記的根由下面的沿用機制補上一輪的。
+				folderProgress[root] = rp.Progress
 				folderPlans[root] = FolderPlanStatus{
 					Mode:             string(p.Plan.Mode),
 					Reason:           p.Plan.Reason,
@@ -896,6 +952,8 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 			AccountDetails: accountDetails,
 			Retiring:       retiring, // arcrun-rag#46：移除並收回中的資料夾進度
 			Resync:         resync,   // arcrun-rag#140：雲端上找不到、正在自動補送的資料夾
+			// #153：這一輪等太久的事。空＝沒有人在等，畫面上不佔位置。
+			Stalls: cfg.guard.Stalls(),
 		}
 		// G-6.2：把「讀不了的檔」寫進狀態檔，App 首頁才有東西可以講。
 		// 排序＝畫面每輪穩定（map 迭代順序隨機，不排的話清單會自己跳動）。
@@ -921,6 +979,21 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 		// #104：收檔策略與被排除的東西 —— 使用者要知道「有幾千個檔沒被收、為什麼」。
 		if len(folderPlans) > 0 {
 			st.FolderPlans = folderPlans
+		}
+		// #159：逐資料夾的同步現況。這一輪沒掃成的根**沿用上一輪**
+		// （同 MergeFolderTreeStore ② 的理由：畫面不該因為一輪掃壞就說「沒有狀態」）；
+		// 已經不在看守清單上的根自然消失——folderProgress 的 key 只可能來自本輪的
+		// knownRoots，移除掉的資料夾不會被沿用回來。
+		for _, root := range knownRoots {
+			if _, ok := folderProgress[root]; ok {
+				continue
+			}
+			if prev, ok := prevStatus.FolderProgress[root]; ok {
+				folderProgress[root] = prev
+			}
+		}
+		if len(folderProgress) > 0 {
+			st.FolderProgress = folderProgress
 		}
 		st.SkippedDocCount = len(skippedSeen)
 		for _, sf := range skippedSeen {
@@ -969,8 +1042,7 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 					//    使用者才看得到「為什麼」而不只是「幾份」。
 					// 2026-08-07：額度冷卻的 skip 訊息（quotaState.noticeNow().Combined()）
 					// 用「會自動恢復」當識別字——同樣要讓使用者看得到原因，不是只看到「幾份」。
-					if strings.Contains(r.Error, "後重試") || strings.Contains(r.Error, "已暫停自動重試") ||
-						strings.Contains(r.Error, "會自動恢復") {
+					if explainsWhySkipped(r.Error) {
 						st.Failures = append(st.Failures, ExtractFail{
 							Path:  r.Path,
 							Error: shortError(r.Error),
@@ -1109,11 +1181,17 @@ func drainPendingTakedowns(
 		}
 		return results, exit
 	}
+	// #153：同一條撤除路徑服務兩件事，而使用者眼中它們不是同一件——
+	// 「我刪了一個檔」跟「我把整個資料夾收回來」卡住時該說的話不一樣。
+	step := stepTakedown
+	if resultType == "folder_takedown" {
+		step = stepRetire
+	}
 	for oldPath, pageName := range m.PendingTakedowns {
 		pace()
 		res := DirectResult{Type: resultType, Path: oldPath}
 		mach := cfg.machineIdentity()
-		status, _, perr := cfg.postJSON(cfg.triggerURL(cfg.RemovedWF), map[string]any{
+		status, _, perr := cfg.postJSON(step, cfg.triggerURL(cfg.RemovedWF), map[string]any{
 			"page_name":     pageName,
 			"path":          oldPath,
 			"library":       cfg.libraryFor(absRoot),
@@ -1391,6 +1469,26 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 		saveManifest() // 拔掉的章與對帳時間當下就落盤（斷點續傳同款）
 	}
 
+	// 🔴 既有卡片的「### 出處」就地修正（`inkstone/Arcrun#167`）——一次性、修完蓋章。
+	// 舊卡的出處寫的是 `../<檔名>`（daemon 自己的目錄結構），AI 照著答、使用者走不到。
+	// 修產生端只治得了新卡，票上寫死「不能只修新的」⇒ 這裡把本機既有的卡重畫那一塊
+	// 並原樣重推（零 LLM，workflow 進門先刪同名舊 blocks ⇒ 取代不疊加）。見 sourcerepair.go。
+	if sr := repairCardSourceBlocks(cfg, absRoot, m, dryRun, false, runNow); sr != nil {
+		if sr.Repushed > 0 {
+			results = append(results, DirectResult{
+				Type: "resync", Path: absRoot, Status: "noticed",
+				Error: fmt.Sprintf("已修好 %d 份筆記的「原文位置」寫法（從前寫的是程式內部路徑，現在會告訴你在哪台機器、哪個知識庫、庫內哪一個檔）", sr.Repushed),
+			})
+		}
+		if sr.Err != "" {
+			results = append(results, DirectResult{
+				Type: "resync", Path: absRoot, Status: "noticed",
+				Error: "更新「原文位置」時有一份沒成功（不影響同步，稍後自動再試）：" + sr.Err,
+			})
+		}
+		saveManifest()
+	}
+
 	// 2026-08-07 task 3：Scan() 會把 removed 的路徑從 m.Entries 整批拿掉（rebuild 語意，
 	// 見 scan.go 步驟 7）——但那只是「偵測到不見了」，不代表下架 POST 已經成功。
 	// 沒有這份快照的話，本輪只要有任何一個 added/modified 事件先觸發了下面的
@@ -1427,6 +1525,34 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 
 	now := runNow.Unix()
 
+	// 🔴 `inkstone/arcrun-rag#153` 第二輪：**樹算出來就立刻落地本機，排在所有雲端呼叫之前。**
+	//
+	// 為什麼非搬到這裡不可（2026-08-28 用 `ARCRUN_TRACE=1` 量出來的，不是推測）：
+	// 對一個**健康**的雲端實例，每一發呼叫實測 24〜33 秒
+	//（資料夾總覽 26.3s／目錄索引 24.0・24.1・23.5s／送出一份筆記 33.2・44.6s）。
+	// 一個 12 層、10 個檔的資料夾，一輪就是十幾分鐘；leo 真正的設定是三個帳號、
+	// 好幾千個檔，一輪是好幾小時。**沒有任何一發超過 300 秒，所以逾時與斷路器都不會動**
+	// ——這不是卡住，是這一輪還沒輪到寫它。
+	//
+	// 而這棵樹是**純本機、秒級**算出來的（就在上面那次 Scan 的產物上），
+	// 它沒有理由排在十幾分鐘的雲端佇列後面。搬到這裡之後，使用者的資料夾結構
+	// 在開跑幾秒內就是對的，即使這一輪還要再跑一小時。
+	//
+	// 內容一個位元都沒變：BuildFolderTree 吃的是 payload.DirStats／m.Entries／
+	// payload.AllExcludedDirs／plan，而從 Scan() 到這裡之間**沒有任何東西動過 m.Entries**
+	//（動它的是下面「removed 暫時放回」那段，本來就在原位置之後）。
+	// 送上雲端那一發（syncFolderTree）**維持在原來的位置**，用的就是這一棵。
+	//
+	// StampMachine（`inkstone/Arcrun#180`）：蓋上「這棵樹是哪一台機器算的」。蓋在這裡
+	// ——build 之後、Publish 與 sync 之前——所以**本機快照與上雲酬載必然是同一份身分**。
+	// 卡片那條路（folderindex／inventory／sourcerepair）用的是同一個 cfg.machineIdentity()，
+	// 同一輪只解析一次，兩條路送上去的值必然相同。
+	tree := BuildFolderTree(absRoot, cfg.libraryFor(absRoot), payload.DirStats, m.Entries,
+		payload.AllExcludedDirs, plan, runNow).StampMachine(cfg.machineIdentity())
+	if !dryRun {
+		PublishFolderTreeNow(cfg.Manifest, root, tree, runNow)
+	}
+
 	// 結構先行（InkStoneCo#43，2026-08-15）：掃描一結束（純本機、免費、秒級）就先把
 	// 「這個資料夾有哪些檔案／最近改了什麼」送上知識庫，**不等 LLM 萃取、不受額度影響**
 	// ——走 rag_ingest_card（零 LLM 的機械收口），所以刻意放在：
@@ -1462,8 +1588,6 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 	// 再加第四個**只屬於它**的：**空資料夾一個事件都不會有**（arcrun-rag#106 的情境本身），
 	// 所以它不能被任何「有事件才做」的閘擋住——分子分母都由現況算出，靜止時
 	// 內容雜湊自然擋住重送，不需要事件當第二道閘。
-	tree := BuildFolderTree(absRoot, cfg.libraryFor(absRoot), payload.DirStats, m.Entries,
-		payload.AllExcludedDirs, plan, runNow)
 	if treeRes := syncFolderTree(cfg, absRoot, m, tree, dryRun, runNow); treeRes != nil {
 		results = append(results, *treeRes)
 		if treeRes.Status != "planned" {
@@ -1547,6 +1671,18 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 				results = append(results, res)
 				continue
 			}
+			// 🔴 #153：這個**帳號**這一輪已經被判定沒有回應 ⇒ 連試都不試。
+			// 與上面的額度冷卻同一層、同一個理由：這不是這個檔的問題，
+			// 記進它的病歷（FailCount／退避階梯）會讓一次雲端沒回應，
+			// 變成一整批檔案「已放棄自動重試」——那是把別人的停機算在使用者頭上。
+			// 沒有這道閘的話，一個沒有回應的帳號會讓這一輪繼續逐檔去撞，
+			// 每撞一次就是一個 Budget，25 個檔就是幾十分鐘。
+			if note := cfg.unreachableNote(); note != "" {
+				res.Status = "skipped"
+				res.Error = note
+				results = append(results, res)
+				continue
+			}
 			// 🔴 t195 止血點：這個檔剛失敗過且還在退避窗口內 → 這輪跳過。
 			//   沒有這道閘時的實測災情：`小果被AFTEE詐貸.pdf` 因雲端 401 失敗，
 			//   每輪重掃又被當成新檔 ⇒ **1387 輪、跨 11 小時**，且它排在佇列前面，
@@ -1578,6 +1714,15 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 			pace() // 2026-08-07：每次要觸發雲端（萃取／POST）之前先節流一下
 			if cfg.Extractor != "" {
 				// 四步定稿：本地萃卡 → 每張卡 POST rag_ingest_card（原文不出機）
+				// 🔴 `inkstone/Arcrun#167`：卡片的「### 出處」要寫得出「哪台機器 ／
+				//    哪個庫 ／ 庫內什麼路徑」，所以萃卡前先把這三件備好交給塑形層。
+				//    三件與下面 cardBody 送雲端的 machine/library/path 是**同一組值**
+				//    ——卡上寫的與雲端存的從此對得起來（不再各說各話）。
+				cardOrigin := SourceOrigin{
+					MachineLabel: cfg.machineIdentity().Label,
+					Library:      cfg.libraryFor(absRoot),
+					LibraryPath:  ev.Path,
+				}
 				var cards []string
 				var xerr error
 				switch cfg.Extractor {
@@ -1590,9 +1735,24 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 					// ⇒ 探測在 RunDirectOnce（ProbeWorkersAI），結果寫進 status.json，
 					//   托盤那行「狀態：」直接告訴用戶該做什麼。
 					// 靜默退回會讓用戶**永遠不知道自己的雲端還沒更新**——正是要避免的黑箱。
-					cards, xerr = ExtractWithWorkersAI(cfg.CypherURL, cfg.APIKey, absRoot, ev.Path)
+					// #153：萃取也是一發會等很久的網路呼叫，而 workers-ai 打的正是
+					// **使用者自己的那台雲端實例**——跟上面那些收口是同一台。
+					// 它有自己的 client timeout，但沒有人在數「這個帳號已經連續幾發
+					// 等不到回覆」⇒ 漏掉這一格的話，單輪上限 25 個檔會變成 25 次
+					// 各自的等待，同一輪照樣走不完。
+					//
+					// 🔴 gemma 那條**刻意不掛**：它打的是 Google，不是使用者的知識庫。
+					// 掛上去的話，Google 慢會被算成「你的知識庫沒有回應」——
+					// 誤導的訊息比沒有訊息更貴（會害人往錯的方向查）。
+					xgate := cfg.openGate(stepExtractDoc)
+					cards, xerr = ExtractWithWorkersAI(cfg.CypherURL, cfg.APIKey, absRoot, ev.Path, cardOrigin)
+					xgate.release()
+					if xerr == nil {
+						xgate.ok()
+					}
+					xerr = xgate.record(xerr) // 只有「等到超時」會被記帳，其餘錯誤原樣往下走
 				case "gemma":
-					cards, xerr = ExtractWithGemma(cfg.GeminiAPIKey, cfg.LLMModel, absRoot, ev.Path)
+					cards, xerr = ExtractWithGemma(cfg.GeminiAPIKey, cfg.LLMModel, absRoot, ev.Path, cardOrigin)
 				default:
 					// t176：claude 路先不支援（RunDirectOnce 開頭已正規化）。
 					// 走到這裡代表 config 有沒見過的值——誠實報錯，不要靜默跳過（禁假綠）。
@@ -1671,7 +1831,7 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 						cardBody["quality"] = "low"
 						cardBody["quality_warnings"] = warns
 					}
-					status, _, perr := cfg.postJSON(cfg.triggerURL(cfg.CardIngestWF), cardBody)
+					status, _, perr := cfg.postJSON(stepIngestCard, cfg.triggerURL(cfg.CardIngestWF), cardBody)
 					res.HTTPStatus = status
 					if perr != nil {
 						res.Status, res.Error = "failed", perr.Error()
@@ -1714,7 +1874,7 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 			// ⚠️ 雲端這支 workflow 本輪**沒有跟著改**（youlin stage 上根本沒部署它，
 			// 現役是 rag_ingest_card）——它會忽略這兩個欄位，行為與從前一字不差。
 			machDirect := cfg.machineIdentity()
-			status, _, perr := cfg.postJSON(cfg.triggerURL(cfg.IngestWF), map[string]any{
+			status, _, perr := cfg.postJSON(stepIngestDoc, cfg.triggerURL(cfg.IngestWF), map[string]any{
 				"page_name":     pageNameOf(ev.Path),
 				"path":          ev.Path,
 				"content":       string(content),
@@ -1751,7 +1911,7 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 			// 連坐殺掉 B 機器同名檔」，而多補一維會改變既有的撤除命中範圍——
 			// 那是另一件事，要另外驗（本輪不驗的不做）。
 			machRm := cfg.machineIdentity()
-			status, _, perr := cfg.postJSON(cfg.triggerURL(cfg.RemovedWF), map[string]any{
+			status, _, perr := cfg.postJSON(stepTakedown, cfg.triggerURL(cfg.RemovedWF), map[string]any{
 				"page_name":     pageNameOf(ev.Path),
 				"path":          ev.Path,
 				"machine":       machRm.ID,
@@ -1890,20 +2050,22 @@ func runDirect(args []string) int {
 		//    ⇒ 開工前先印一筆 `phase:"start"`，托盤收到就顯示「同步中…」，
 		//      收到 `phase:"done"` 再切回「看守中」。
 		//    形狀相容：兩筆都有 `at`，舊版托盤只會多算一次 round，不會壞掉。
-		startOut, _ := json.MarshalIndent(struct {
+		//
+		// 🔴 #153：這兩筆改走 printJSONLine——「還在等」的播報跑在另一條 goroutine 上，
+		// 而 done 那筆可能有幾十 KB。共用同一把鎖，兩邊才不會把彼此的 JSON 切成兩半
+		//（切壞一次，supervisor 的 decoder 就再也讀不到這個行程的任何一筆，見 stallguard.go）。
+		printJSONLine(struct {
 			At    string `json:"at"`
 			Phase string `json:"phase"`
-		}{time.Now().Format(time.RFC3339), "start"}, "", "  ")
-		fmt.Println(string(startOut))
+		}{time.Now().Format(time.RFC3339), "start"})
 
 		results, exit, _ := RunDirectOnce(cfg, *dryRun)
-		out, _ := json.MarshalIndent(struct {
+		printJSONLine(struct {
 			At      string         `json:"at"`
 			Phase   string         `json:"phase"`
 			Folders []string       `json:"folders"`
 			Results []DirectResult `json:"results"`
-		}{time.Now().Format(time.RFC3339), "done", cfg.Folders(), results}, "", "  ")
-		fmt.Println(string(out))
+		}{time.Now().Format(time.RFC3339), "done", cfg.Folders(), results})
 		return exit
 	}
 

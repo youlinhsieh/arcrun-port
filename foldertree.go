@@ -58,7 +58,22 @@ const (
 	//
 	// 🔴 **超過不准安靜地截掉**——`FolderTree.Truncated` 會被送上去、由畫面講出來
 	//（同 #104「排除規則要看得見」那條紅線：安靜地少講與講一個 0，對使用者是同一件事）。
-	MaxFolderTreeNodes = 300
+	//
+	// 🔴 2026-08-28（inkstone/Arcrun#180）從 300 提到 2000。leo 的規格是
+	// 「**雲端看到所有的 folder**」，而剪枝拿掉之後節點會變多——300 會讓「看得到全部」
+	// 在大資料夾上靜默失效（`Truncated` 雖然誠實，但那是在說「我做不到你要的事」）。
+	//
+	// **實測（本次改動後，同一台機器）**：
+	//
+	//	youlinhsieh-test1   12 個節點（地端 `find -type d` 非隱藏 12）
+	//	youlinhsieh-test2   13（地端 13）
+	//	pms                 53（地端 360——差額是 node_modules／dist／.gitignore 宣告的，
+	//	                    那幾種仍然剪枝，但節點與理由都在）
+	//	InkStoneCo          62（地端 14,923，同上）
+	//
+	// ⇒ 真實資料夾離 300 都還很遠；2000 是留給「一個沒有 .gitignore 的大筆記庫」的餘裕。
+	// 一棵樹在收端是一把 KV、整棵覆寫，2000 個節點約 400 KB，離 KV 的 25 MB 很遠。
+	MaxFolderTreeNodes = 2000
 
 	// folderTreeRetryDelay：整棵樹送失敗後，同一份內容多久才准再試。
 	// 理由同 inventory.go：積壓時每輪都有事件，沒有退避就是每 5 秒撞一次（t195 教訓）。
@@ -106,8 +121,18 @@ type FolderNode struct {
 	// ExcludedFiles＝收檔策略決定不收的（leo 講的「程式碼」多半落在這裡，見 ingestplan.go）。
 	ExcludedFiles int `json:"excluded_files"`
 
-	// Skipped＝這整棵子樹被剪掉了（沒有走進去），所以上面的數字**全部是 0 而且不是事實**。
-	// 🔴 畫面看到 Skipped 必須改講 SkipReason，不准顯示 `0/0`——那會是我們自己編的數字。
+	// Skipped＝**這一層的檔案這次一個都不收**。SkipReason 說得出為什麼。
+	//
+	// 🔴 2026-08-28（inkstone/Arcrun#180）語意收窄了一格，因為 leo 推翻了原本的做法：
+	// 以前 Skipped 同時代表「整棵沒走進去」⇒ 數字全是 0 而且不是事實 ⇒ **底下一個
+	// 子節點都不會生**。leo 的原話：「**所有的 system-dev 都可以展開，因為就算沒有
+	// 可萃的它也有下層**」「我要的就是雲端看到**所有的 folder** 像 tree 一樣呈現」。
+	// ⇒ 現在絕大多數 Skipped 節點是**走進去了、數字是真的、子節點也都在**，
+	//   只是這一層的檔不收（範本檔、非本次收檔範圍…）。
+	//
+	// 仍然有數字是 0 而且不是事實的那一種——真的沒走進去的（`node_modules` 這類，
+	// 見 IngestPlan.SkipsDirWhy 剩下的五條）。**分辨方法：那種節點沒有子節點。**
+	// 畫面看到 Skipped 一律改講 SkipReason，不要只顯示分子分母。
 	Skipped bool `json:"skipped,omitempty"`
 	// SkipReason＝一句話講給使用者聽的「為什麼整個沒收」（原文來自 IngestPlan.SkipsDirWhy）。
 	SkipReason string `json:"skip_reason,omitempty"`
@@ -124,6 +149,41 @@ type FolderTree struct {
 	Truncated   bool         `json:"truncated,omitempty"` // 節點超過上限，畫面要講出來
 	TotalNodes  int          `json:"total_nodes"`         // 截斷前的真實節點數
 	GeneratedAt int64        `json:"generated_at"`
+
+	// Machine／MachineLabel＝**這棵樹是哪一台機器報上來的**（`inkstone/Arcrun#180`）。
+	//
+	// 🔴 為什麼非有不可：雲端的庫清單是「總庫 → 機器 → 資料夾」三層。樹的酬載裡沒有
+	// 這一格時，**每一個庫都只能掛在「未知來源」底下** ⇒ leo 2026-08-28 看到 16 個庫
+	// 全擠在同一個未知節點下，第一反應是「這是把別的帳號同步的資料夾外洩了？」。
+	// 那個驚嚇是畫面造成的，而畫面之所以說不出來，是因為**上行酬載根本沒送**。
+	//
+	// 🔴 **不是新發明的東西**：機器身分早就存在（`machine.json`／`ResolveMachine`），
+	// 卡片那條路也早就在送了（`folderindex.go`／`inventory.go`／`sourcerepair.go`
+	// 的 `"machine"`／`"machine_label"` 兩欄）。這裡**照那條路走**，欄名一字不差，
+	// 收端才不必為了樹另認一組欄位。
+	//
+	// Machine＝比對鍵（鑄好不變）；MachineLabel＝顯示名（使用者可在 config 改）。
+	// 兩格分開的理由見 machineid.go：改名不該讓庫裡憑空多出一台機器。
+	//
+	// 🔴 這兩格**進 Hash()**（不像 GeneratedAt 那樣被剔掉）：使用者改了 machine_label
+	// 之後，雲端要看得到新名字 ⇒ 內容雜湊必須跟著變，否則冪等閘會讓它永遠不再送。
+	Machine      string `json:"machine,omitempty"`
+	MachineLabel string `json:"machine_label,omitempty"`
+}
+
+// StampMachine 蓋上「這棵樹是哪一台機器算的」，回一份新的樹（不改原件）。
+//
+// 🔴 為什麼是「蓋章」而不是塞進 BuildFolderTree 的參數：BuildFolderTree 是純函式，
+// 吃的全是「這個資料夾長什麼樣」的事實；機器身分是**這台電腦是誰**，是另一回事。
+// 分開之後，樹的既有測試不必為了機器身分多餵一份假身分。
+//
+// 🔴 為什麼要蓋在樹上、而不是送出時才從 cfg 拿：本機快照（folder-trees.json，
+// 桌面小幫手讀的那份）與上雲的酬載**是同一個 FolderTree**。蓋在樹上，兩邊必然一致；
+// 送出時才拿，本機那份就永遠是空的——而「本機那份有沒有 machine」正是這次的檢查點。
+func (t FolderTree) StampMachine(m MachineIdentity) FolderTree {
+	t.Machine = m.ID
+	t.MachineLabel = m.Label
+	return t
 }
 
 // BuildFolderTree 把「走訪時數出來的分母」與「manifest 現況的分子」合成一棵樹。
@@ -162,6 +222,14 @@ func BuildFolderTree(absRoot, library string, dirs map[string]*dirStat, entries 
 		n.TotalFiles = st.total
 		n.UnsupportedFiles = st.unsupported
 		n.ExcludedFiles = st.excluded
+		// #180：這一層走進去了、數字是真的，但**一個檔都沒收** ⇒ 照樣要講得出為什麼。
+		// 以前這種節點根本不存在（整棵被剪掉），現在存在了，就不能只給一個沒有解釋的
+		// `0 / 6`——那對使用者跟「安靜地少收」是同一件事。
+		// 🔴 子節點與真實數字都留著（leo 2026-08-28：「跳過的節點仍要展得開」）。
+		if st.total > 0 && st.excluded == st.total && st.excludeWhy != "" {
+			n.Skipped = true
+			n.SkipReason = st.excludeWhy
+		}
 	}
 
 	// 分子：manifest 現況。已送達且送上去之後沒再改過＝已同步，其餘＝還在路上。
@@ -321,8 +389,14 @@ func syncFolderTree(cfg *DirectConfig, absRoot string, m *Manifest, tree FolderT
 		"generated_at": tree.GeneratedAt,
 		"sync_token":   h,
 		"nodes":        tree.Nodes,
+		// 🔴 機器身分（`inkstone/Arcrun#180`）：欄名與卡片那條路一字不差
+		// （`folderindex.go`／`inventory.go`／`sourcerepair.go`），收端不必另認一組。
+		// 值取自 `tree`（已由 StampMachine 蓋章）而不是這裡再問一次 cfg——
+		// 本機快照與上雲酬載共用同一個 FolderTree，一個來源就不會漂。
+		"machine":       tree.Machine,
+		"machine_label": tree.MachineLabel,
 	}
-	status, _, err := cfg.postJSON(cfg.folderTreeURL(), body)
+	status, _, err := cfg.postJSON(stepFolderTree, cfg.folderTreeURL(), body)
 	res.HTTPStatus = status
 	if err != nil {
 		res.Status = "failed"
@@ -444,4 +518,39 @@ func MergeFolderTreeStore(prev FolderTreeStore, fresh map[string]FolderTree, kno
 		out.Trees[root] = t // ①
 	}
 	return out
+}
+
+// PublishFolderTreeNow 把**這一個根**剛算好的樹立刻寫進本機快照，不等整輪跑完。
+//
+// 🔴 為什麼要有它（`inkstone/arcrun-rag#153` 第二輪，2026-08-28 實測）：
+// 一輪同步是**一條線**走完的，而對一個健康的雲端實例，每一發呼叫實測要 24〜33 秒
+// （`ARCRUN_TRACE=1` 量的：資料夾總覽 26.3s、目錄索引 24.0/24.1/23.5s、
+//  送出一份筆記 33.2/44.6s）。一個 12 層、10 個檔的資料夾，一輪就是**十幾分鐘**；
+// leo 真正的設定是三個帳號、好幾千個檔，一輪是**好幾小時**。
+//
+// 而 `folder-trees.json` 從前**只在整輪的最後**才落地
+// ⇒ 使用者看到的是「小幫手開著、沒有錯誤、什麼都不動，資料夾結構永遠停在上一版」。
+// **那不是卡住，是這一輪還沒輪到寫它。**
+//
+// 樹本身是**純本機、秒級**算出來的（BuildFolderTree 在掃描一結束就有答案），
+// 它沒有任何理由要排在十幾分鐘的雲端佇列後面等。
+//
+// 與收工時那次 SaveFolderTreeStore 的分工：
+//   - 這裡：只**更新這一個根**，不刪任何東西（還不知道整輪看守哪些根）。
+//   - 收工：跑完整的 MergeFolderTreeStore，該刪的（已不看守的根）在那時才刪。
+// 兩次都是冪等的覆蓋，先寫一次不會讓收工那次結果不同。
+//
+// 失敗一律吞掉：快照是給畫面看的，寫不進去不該擋住同步本體。
+func PublishFolderTreeNow(manifestPath, root string, tree FolderTree, now time.Time) {
+	if manifestPath == "" || root == "" || len(tree.Nodes) == 0 {
+		return // 沒算出東西就別覆蓋上一輪的好資料（同 MergeFolderTreeStore 規則②）
+	}
+	path := FolderTreeStorePath(manifestPath)
+	store, _ := LoadFolderTreeStore(path) // 讀不到＝沒有上一輪，零值可用
+	if store.Trees == nil {
+		store.Trees = map[string]FolderTree{}
+	}
+	store.Trees[root] = tree
+	store.UpdatedAt = now.UTC().Format(time.RFC3339)
+	_ = SaveFolderTreeStore(path, store)
 }

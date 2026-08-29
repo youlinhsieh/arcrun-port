@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // AccountSyncStatus 彙總單一帳號的每輪同步結果（t104 多帳號看守）。
@@ -104,6 +105,23 @@ type SyncStatus struct {
 	// 與 Retiring 同族的現況快照，見 ResyncStatus 註解。
 	Resync map[string]ResyncStatus `json:"resync,omitempty"`
 
+	// FolderProgress＝**逐個看守資料夾**的同步現況（key＝資料夾路徑，`inkstone/arcrun-rag#159`）。
+	//
+	// 🔴 為什麼要有：小幫手畫面上每個資料夾都要能一眼看出「同步了沒」，而在這之前
+	// 那一格唯一的資料來源是 #140 的補送說明——**它只在有補送的時候才有值**，
+	// 於是畫面只好拿「有沒有那句話」當狀態。2026-08-28 leo 看到七列有六列寫「補送中」，
+	// 連 pending 已經是 0 的也照樣寫（實測 youlinhsieh-test1：pending=0／repaired=2，
+	// 畫面仍標補送中）——那個標籤量的根本不是同步狀態。
+	//
+	// 🔴 **不另算一套**：值就是 (*Manifest).Progress() 的原件，與首頁那行大數字、
+	// 診斷檔用同一個函式。逐資料夾加起來會等於首頁總量，因為它們本來就是同一組
+	// 數字被切開，不是兩份實作。
+	//
+	// 與 FolderPlans 同族的現況快照；某一輪那個根沒掃成（payload 為 nil）時**沿用
+	// 上一輪**，不要讓使用者看到昨天還好好的資料夾突然沒有狀態
+	// （同 MergeFolderTreeStore ② 的理由）。
+	FolderProgress map[string]SyncProgress `json:"folder_progress,omitempty"`
+
 	// 🔴 G-6.2「不准安靜地略過」（2026-08-06）：副檔名不在 allowedExt 的檔案，
 	// 以前在 scan.go 的白名單閘就 `return nil` 蒸發了——沒事件、沒紀錄、沒畫面。
 	// 使用者丟一份 .doc 進資料夾，得到的回應是**完全的沉默**。
@@ -140,6 +158,17 @@ type SyncStatus struct {
 	// 不會被清成 0（現況快照，不是本輪計數）。
 	Progress         SyncProgress     `json:"progress"`
 	FailureBreakdown FailureBreakdown `json:"failure_breakdown"`
+
+	// Stalls＝這一輪「等太久」的事（`inkstone/arcrun-rag#153`）。
+	//
+	// 為什麼要有這一格：2026-08-28 實撞的畫面是**小幫手開著、沒有錯誤訊息、
+	// 什麼都不動**——同步停在一發等不到回覆的請求上，而使用者看得到的每一個
+	// 數字都還是上一輪的。**靜默的等待跟當掉對使用者是同一件事**，
+	// 所以「哪個帳號、哪件事、等了多久」要有地方講。
+	//
+	// 與 SkippedDocs 同族：每輪重算的現況快照，不進 CarryForwardActivity
+	//（上一輪等太久不代表這一輪也在等，帶下來就會變成一個永遠擦不掉的警告）。
+	Stalls []StalledCall `json:"stalls,omitempty"`
 }
 
 // FolderPlanStatus＝某個看守資料夾這一輪用了什麼收檔策略、據此少收了什麼
@@ -226,4 +255,29 @@ func LoadSyncStatus(path string) (SyncStatus, error) {
 // tray 寫入此檔 → collector 偵測到後立刻跑一輪同步並刪除它。
 func SyncNowSignalPath(manifestPath string) string {
 	return filepath.Join(filepath.Dir(manifestPath), "sync-now")
+}
+
+// explainsWhySkipped 回答：「這一則 `skipped` 的訊息，講得出**為什麼**嗎？」
+// 講得出 ⇒ 收進 status.json 的失敗清單，畫面才有原因可講；講不出 ⇒ 不佔畫面。
+//
+// 🔴 為什麼要抽成具名函式（`inkstone/arcrun-rag#153` 第三輪，2026-08-28 差點實撞）：
+// 這個判準本來是**寫死在 direct.go 裡的三個字串比對**，而產生那些訊息的地方在別的檔。
+// 我改了斷路器的措辭（「會自動恢復」→「稍後會自動再試」），兩邊當場對不上——
+// 後果不是報錯，是**那 9 個被跳過的檔會連一句原因都沒有地從畫面上消失**，
+// 正是這個 repo 一再修的「安靜地略過」。
+//
+// 抽成一個函式解不掉「字串比對很脆」這件事，但它解掉了**兩邊會各自漂走**：
+// 現在只有一個地方定義「講得出原因」，而且有測試守著（sync_status_test.go）。
+// 新增訊息時，讓它通過這個函式，或把新的識別字加在這裡——不要在別處另開一張表。
+func explainsWhySkipped(msg string) bool {
+	for _, mark := range []string{
+		"後重試",     // 退避中：「上次失敗（第 N 次），X 後重試」
+		"已暫停自動重試", // 連續失敗到上限
+		"會自動恢復",   // 額度冷卻／帳號暫時打不通，之後自己會好
+	} {
+		if strings.Contains(msg, mark) {
+			return true
+		}
+	}
+	return false
 }
