@@ -425,7 +425,7 @@ type SourceOrigin struct {
 const unknownOriginMark = "（未知）"
 
 // originSep＝三件式之間的分隔符，與 portal 的來源顯示同一種
-//（`youlinhsieh@Leo-MBA › rt-lib › 檔名 第 4 段`）⇒ 使用者在兩個地方看到同一種形狀。
+// （`youlinhsieh@Leo-MBA › rt-lib › 檔名 第 4 段`）⇒ 使用者在兩個地方看到同一種形狀。
 const originSep = " › "
 
 // Human 回一句「這份原文在哪」：`機器 › 知識庫 › 庫內路徑`。
@@ -583,7 +583,13 @@ func renderConceptCard(c WikiConcept, cardName, docCard string, origin SourceOri
 
 // ── 落地：BuildWikiDoc（萃取成功）／MarkDocNoConcept（標空）／RemoveWikiDoc（下架）──
 
+// ensureWikiIgnored 對一個 `.wiki/` 做兩件「宣告這是我們的」的事：
+// ① 對 git 隱形（自帶 .gitignore，只寫一次、不覆蓋）
+// ② 對作業系統隱形（Windows 掛 FILE_ATTRIBUTE_HIDDEN；其他平台 no-op，見 owndir.go）
+// ② 放在 ① 的「已存在就 return」之前：升級前建的 .wiki 已經有 .gitignore，
+// 但還沒有隱藏屬性，這一輪寫到它就要順手補上（inkstone/arcrun-rag#193）。
 func ensureWikiIgnored(wikiDir string) {
+	markOwnDirHidden(wikiDir)
 	target := filepath.Join(wikiDir, ".gitignore")
 	if _, err := os.Stat(target); err == nil {
 		return
@@ -820,6 +826,21 @@ func MarkDocNoConcept(absRoot, relPath, reason string, now time.Time) error {
 		return err
 	}
 	return saveWikiManifest(absRoot, m)
+}
+
+// WikiDocCardRels 回傳一份原稿目前記在 manifest 裡的卡（相對監看根，hub 在第一個）；
+// 沒有記錄就回 nil。**唯讀**，不動 manifest——direct.go 在呼叫 RemoveWikiDoc（會把
+// 這筆記錄一起刪掉）之前，要先問到「這份文件上雲的概念卡叫什麼名字」才送得出下架
+// 請求（arcrun-rag#213：續讀機制的概念卡各自有自己的 page_name，不能只下架 hub）。
+func WikiDocCardRels(absRoot, relPath string) []string {
+	node, base := docNodeAndPath(absRoot, relPath)
+	nodeKey := nodeKeyOf(node)
+	m := loadWikiManifest(absRoot)
+	d := m.find(nodeKey, base)
+	if d == nil {
+		return nil
+	}
+	return append([]string(nil), d.Cards...)
 }
 
 // RemoveWikiDoc 原稿消失時，收走它的卡並把它從索引與 manifest 移除。
