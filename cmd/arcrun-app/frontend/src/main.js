@@ -93,12 +93,6 @@ function chunkLines(text, per = 20, max = 3) {
 
 // Wails 把 Go 的錯誤包成 `Error: …`：去掉英文前綴，只留我們自己的短字（#240 c18387）
 function errText(ex) { return String((ex && ex.message) || ex || '').replace(/^Error:\s*/, ''); }
-// 雲端還不能收回報（代碼 cloud_old）時，回報鈕換成能動手的「更新」，開該帳號的 Portal
-function oldCloudButton(accIdx) {
-  const a = (state.accounts || [])[accIdx] || (state.accounts || [])[0];
-  return a ? `<button class="primary" data-portal="${esc(libPortalURL(a))}" title="雲端要先更新才能收回報">更新</button>` : '';
-}
-
 function more(line, detail) {
   if (!detail) return `<div class="d one">${esc(line)}</div>`;
   return `<details class="more"><summary>${esc(line)}</summary><div class="d">${detail}</div></details>`;
@@ -336,9 +330,20 @@ function installURLFor(email) {
 // onlyAccount＝帳號分頁只顯示它自己的（c18000：每個分頁只講自己的事）；null＝首頁全列。
 // 同一個帳號的停工合成一張卡：標題＝件數加總（與狀態列的 `!` 同一個數字），
 // 展開看各原因各幾份；一顆「回報」送出全部、一顆 × 關閉（#240 c18341）。
+// 回報送出後，卡片會因為「已處理」從清單消失——但用戶要看得到「送出去了」：
+// 留一行 `✓ 已回報` 停 3 秒再淡出（#240 c18503）。key＝帳號名稱。
+const reportedFlash = {};
+function flashReported(account) {
+  reportedFlash[account] = Date.now() + 3000;
+  setTimeout(() => { delete reportedFlash[account]; renderPage(); }, 3100);
+}
+
 function cardStalls(stalls, onlyAccount) {
   const list = (stalls || []).filter((x) => !onlyAccount || x.account === onlyAccount);
-  if (!list.length) return '';
+  if (!list.length) {
+    return onlyAccount && reportedFlash[onlyAccount] > Date.now()
+      ? `<div class="card alertcard okflash" role="status"><div class="nt">✓ 已回報</div></div>` : '';
+  }
   const total = list.reduce((t, x) => t + x.count, 0);
   const lines = list.slice(0, 3).map((x) => `<div class="d one raw" title="${esc(Array.from(x.label).slice(0, 25).join(''))}">${esc(Array.from(x.label).slice(0, 12).join(''))} ${x.count}</div>`).join('');
   // 鍵可能含任何字元（逗號、引號）：一律用 JSON 陣列放在屬性裡，不用分隔字元拼接再切開
@@ -1151,8 +1156,7 @@ async function submitFeedback() {
     if (status) status.textContent = '';
     if (err) {
       const t = errText(ex);
-      if (t === 'cloud_old') { err.innerHTML = oldCloudButton(0); wire(err); }
-      else err.textContent = Array.from(t).slice(0, 60).join('');
+      err.textContent = Array.from(t).slice(0, 60).join('');
       err.style.display = 'block';
     }
   } finally {
@@ -1455,23 +1459,19 @@ function wire(root) {
     b.onclick = async () => {
       const fps = JSON.parse(b.dataset.stallall || '[]');
       const msg = b.closest('.alertcard').querySelector('.stallmsg');
+      const account = ((state.accounts || [])[Number(b.dataset.accidx)] || {}).name || '';
       b.disabled = true;
       if (msg) msg.textContent = '…';
       try {
         for (const fp of fps) await go.ReportStall(fp);   // 回報＝已處理，卡片與紅點隨之消失
+        flashReported(account);                             // 但先留一行 ✓ 已回報 讓用戶看見
         await tick();
       } catch (ex) {
         const t = errText(ex);
-        if (t === 'cloud_old') {
-          // 不出整句：按鈕直接變成能動手的「更新」
-          if (msg) msg.textContent = '';
-          b.outerHTML = oldCloudButton(Number(b.dataset.accidx));
-          wire(root);
-          return;
-        }
         b.disabled = false;
-        // 真的失敗只留一行，原因點開才看
-        if (msg) msg.innerHTML = `<details class="more"><summary>⚠ 失敗</summary><div class="d one raw">${esc(Array.from(t).slice(0, 20).join(''))}</div></details>`;
+        b.textContent = '重試';
+        // 真的失敗只留一行 `⚠ 沒送出`＋「重試」，原因點開才看
+        if (msg) msg.innerHTML = `<details class="more"><summary>⚠ 沒送出</summary><div class="d one raw">${esc(Array.from(t).slice(0, 20).join(''))}</div></details>`;
       }
     };
   });
