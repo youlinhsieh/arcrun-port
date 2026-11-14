@@ -13,6 +13,20 @@ import { glyphSvg } from './appglyph.js';   // App 圖示：字形由實例提�
 
 const go = window.go.main.App;
 const $ = (id) => document.getElementById(id);
+
+// 頻道身分（inkstone/arcrun-rag#135）：這個 App 是正式版還是 Stage 版，由後端（collector/channel 那張唯一的表）告訴前端，
+// 前端不自己寫任何「stage／prod」的網址或判斷。取回前先用正式版的值（＝以前寫死的值），取不到也不壞。
+let channelInfo = { name: 'prod', isStage: false, appName: 'Arcrun', tag: '', installUrl: 'https://install.arcrun.dev/', defaultConnect: '' };
+(async () => {
+  try {
+    const c = await go.GetChannel();
+    if (c && c.name) channelInfo = c;
+  } catch (e) { /* 舊後端沒有這個方法：維持正式版 */ }
+  document.title = channelInfo.appName;
+  const b = $('brandHome');
+  if (b && channelInfo.tag) b.setAttribute('data-tag', channelInfo.tag);   // 邊欄 logo 旁的 Stage 標記（style.css）
+  document.documentElement.setAttribute('data-channel', channelInfo.name);
+})();
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
   ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
@@ -198,6 +212,7 @@ function goPage(p) {
 function ensureTabData(idx) {
   if (libTabOf(idx) === 'usage') refreshUsage(idx);
   if (libTabOf(idx) === 'apps') loadApps(idx);
+  if (libTabOf(idx) === 'cards' && !kc[idx]) kcLibs(idx);
 }
 // 預設落在儀表板（碼表／用量）頁：用戶開 App 第一件事是「它有沒有在跑」，儀表板有跳動的數字，一眼就知道（#246 c18824）。
 // 用戶手動切過頁籤就記住（只在這次開著 App 期間；重開 App 回到儀表板），不會在換帳號、回首頁再進來時被硬拉回去。
@@ -217,7 +232,71 @@ function setLibTab(idx, tab) {
 //   · 同步、資料夾、App、用量、AI 與設定、停工回報，全部在各帳號分頁裡
 function pageHome(s) {
   if (!s.accounts || !s.accounts.length) return onboarding();
-  return statusStrip(s) + sectionMyApps(s);
+  return chatBox(s) + statusStrip(s) + sectionMyApps(s);
+}
+
+
+// ── 首頁問答框（inkstone/arcrun-rag#297）──
+// leo 2026-11-11：「小幫手很小不要再做一個右側邊欄，直接加在 App 頁」⇒ 放在首頁最上方。
+// 薄殼：問題只送主帳號（左欄第一個）的 /portal/data/ask，其他帳號由後端自動連、連結碼不出現在畫面。
+// 只有按「送出」才打網路，不輪詢。畫面暫存只活在這個視窗的記憶體裡。
+let chat = { q: '', busy: false, asked: '', history: [], res: null };
+function chatBox(s) {
+  const r = chat.res;
+  let out = '';
+  if (chat.busy) out = `<div class="d one">查詢中…</div>`;
+  else if (r) {
+    const bad = (r.accounts || []).filter((x) => !x.ok);
+    const logins = r.needsLogin ? [{ accIdx: 0, label: ((s.accounts || [])[0] || {}).name || '' }]
+      : bad.filter((x) => x.reason === 'needs_login' && x.accIdx >= 0);
+    out = `
+      ${r.answer ? `<pre class="chatans">${esc(r.answer)}</pre>` : ''}
+      ${r.error && !r.needsLogin ? `<div class="err" role="alert">${esc(r.error)}</div>` : ''}
+      ${(r.cards || []).length ? `<div class="chatsrc">${r.cards.map((c) => `
+        <${c.accIdx >= 0 ? 'button' : 'span'} class="nm${c.cited ? ' cited' : ''}" title="${esc(c.excerpt || '')}"${c.accIdx >= 0 ? ` data-kcopen="${c.accIdx}|${esc(c.library)}|${esc(c.pageName)}"` : ''}>${c.n} · ${esc(c.account)} · ${esc(c.library)} · ${esc(c.pageName)}</${c.accIdx >= 0 ? 'button' : 'span'}>`).join('')}</div>` : ''}
+      ${bad.length ? `<div class="chatsrc">${bad.map((x) => `<span class="nchip" title="${esc(x.detail || '')}">${esc(x.label)}<b>⚠</b></span>`).join('')}</div>` : ''}
+      ${(r.accounts || []).filter((x) => x.reason === 'via_helper').map((x) => `<div class="d one">${esc(x.label)}：${esc(x.detail || '')}</div>`).join('')}
+      ${logins.map((x) => `
+        <div class="chatlogin"><span class="nm">${esc(x.label)}</span>
+          <input type="password" class="chatpw" data-chatacc="${x.accIdx}" placeholder="密碼" aria-label="${esc(x.label)} 的密碼"/>
+          <button data-chatlogin="${x.accIdx}">登入</button></div>
+        ${r.needsLogin ? `<div class="err" role="alert">${esc(r.error)}</div>` : ''}`).join('')}`;
+  }
+  return `
+    <section class="chat" aria-label="問答">
+      <div class="chatrow">
+        <input type="text" id="chatQ" placeholder="問問你所有庫裡的知識" value="${esc(chat.q)}" ${chat.busy ? 'disabled' : ''}/>
+        <button class="primary" id="chatGo" ${chat.busy ? 'disabled' : ''}>送出</button>
+      </div>
+      ${out}
+    </section>`;
+}
+async function askChat() {
+  const q = chat.q.trim();
+  if (!q || chat.busy) return;
+  chat.busy = true; chat.asked = q; chat.res = null;
+  renderPage();
+  let res;
+  try { res = await go.AskLibraries(q, chat.history); }
+  catch (ex) { res = { error: errText(ex), cards: [], accounts: [] }; }
+  chat.busy = false; chat.res = res;
+  if (res.answer) {
+    chat.history = chat.history.concat([{ role: 'user', content: q }, { role: 'assistant', content: res.answer }]).slice(-6);
+    chat.q = '';
+    const cq = $('chatQ'); if (cq) cq.value = '';   // 輸入框有焦點時 morph 不會動它
+  }
+  renderPage();
+}
+async function chatLogin(btn) {
+  const idx = Number(btn.dataset.chatlogin);
+  const pw = btn.closest('.chatlogin').querySelector('.chatpw');
+  btn.disabled = true;
+  try { await go.PortalLogin(idx, pw.value); await askChat(); }
+  catch (ex) {
+    btn.disabled = false;
+    if (chat.res) chat.res.error = errText(ex);
+    renderPage();
+  }
 }
 
 // 狀態列只放符號加數字，不放句子（#240 c18290，leo：「如果你裡面顯示了一句話就要檢討是否不需要這句話」）。
@@ -308,7 +387,7 @@ function sectionMyApps(s) {
 // installURLFor：與 portal 版本卡同一個做法——落後才需要按，按下去帶 email 讓安裝頁
 // 預填，既有實例更新免辨識碼（安裝器 t154），不必讓使用者自己去 install.arcrun.dev 找。
 function installURLFor(email) {
-  const base = 'https://install.arcrun.dev/';
+  const base = channelInfo.installUrl;
   return email ? base + '?email=' + encodeURIComponent(email) : base;
 }
 
@@ -336,25 +415,56 @@ function flashReported(account) {
 }
 
 function cardStalls(stalls, onlyAccount) {
-  const list = (stalls || []).filter((x) => !onlyAccount || x.account === onlyAccount);
-  if (!list.length) {
+  const all = (stalls || []).filter((x) => !onlyAccount || x.account === onlyAccount);
+  if (!all.length) {
     return onlyAccount && reportedFlash[onlyAccount] > Date.now()
-      ? `<div class="card alertcard okflash" role="status"><div class="nt">✓ 已回報</div></div>` : '';
+      ? `<div class="card alertcard okflash" role="status"><div class="nt">✓ 已通報</div></div>` : '';
   }
-  const total = list.reduce((t, x) => t + x.count, 0);
-  const lines = list.slice(0, 3).map((x) => `<div class="d one raw" title="${esc(Array.from(x.label).slice(0, 25).join(''))}">${esc(Array.from(x.label).slice(0, 12).join(''))} ${x.count}</div>`).join('');
+  // #330：小幫手先自己修；修不了才問你。三種狀態各一張卡：
+  //   ask       修不了 · 要通報嗎（先「看內容」，同意才寄，寄的就是你看到的那一份）
+  //   reported  已通報 · 處理中（帶票號）
+  //   fixed     已修好
   // 鍵可能含任何字元（逗號、引號）：一律用 JSON 陣列放在屬性裡，不用分隔字元拼接再切開
-  const fps = esc(JSON.stringify(list.map((x) => x.fingerprint)));
-  const keys = esc(JSON.stringify(list.map((x) => x.dismissKey)));
-  return `
+  const parts = [];
+  for (const st of ['ask', 'reported', 'fixed']) {
+    const list = all.filter((x) => (x.state || 'ask') === st);
+    if (!list.length) continue;
+    const total = list.reduce((t, x) => t + x.count, 0);
+    const lines = list.slice(0, 3).map((x) => `<div class="d one raw" title="${esc(Array.from(x.label).slice(0, 25).join(''))}">${esc(Array.from(x.label).slice(0, 12).join(''))}${x.count ? ' ' + x.count : ''}</div>`).join('');
+    const fps = esc(JSON.stringify(list.map((x) => x.fingerprint)));
+    const keys = esc(JSON.stringify(list.map((x) => x.dismissKey)));
+    const accidx = (state.accounts || []).findIndex((x) => x.name === list[0].account);
+    const tickets = Array.from(new Set(list.map((x) => x.ticket).filter(Boolean)));
+    const ticketLine = tickets.length ? `<div class="d mono" data-data="1">${esc(tickets.join(' '))}</div>` : '';
+    const close = `<button class="x" data-dismiss="${keys}" title="關閉" aria-label="關閉">×</button>`;
+    if (st === 'ask') {
+      parts.push(`
     <div class="card alertcard" role="alert" data-stall-card="1">
-      <button class="x" data-dismiss="${keys}" title="關閉" aria-label="關閉">×</button>
-      ${list.length > 1
-        ? `<details class="more"><summary>⚠ 停住 ${total}</summary>${lines}</details>`
-        : `<div class="nt" data-data="1" title="${esc(Array.from(list[0].label).slice(0, 25).join(''))}">⚠ 停住 ${total}</div>`}
-      <div class="acts"><button class="primary" data-stallall="${fps}" data-accidx="${(state.accounts || []).findIndex((x) => x.name === list[0].account)}">回報</button></div>
+      ${close}
+      <div class="nt" title="小幫手試過了 要開發團隊才能修">⚠ 修不了 · 要通報嗎 ${total}</div>
+      ${lines}
+      <pre class="stallpreview" data-preview style="display:none"></pre>
+      <div class="acts"><button class="primary" data-stallview="${fps}" data-accidx="${accidx}">看內容</button><button data-stalldecline="${fps}">不用了</button></div>
       <div class="d stallmsg" style="margin-top:6px"></div>
-    </div>`;
+    </div>`);
+    } else if (st === 'reported') {
+      parts.push(`
+    <div class="card alertcard" role="status" data-stall-card="1">
+      ${close}
+      <div class="nt" title="修好會放進新版 到更新頁看">✓ 已通報 · 處理中</div>
+      ${lines}${ticketLine}
+      <div class="acts"><button data-gopage="update">更新</button></div>
+    </div>`);
+    } else {
+      parts.push(`
+    <div class="card alertcard" role="status" data-stall-card="1">
+      ${close}
+      <div class="nt">✓ 已修好</div>
+      ${lines}${ticketLine}
+    </div>`);
+    }
+  }
+  return parts.join('');
 }
 
 // 「今天的 AI 額度用完了」卡（P8，2026-08-09）。
@@ -910,10 +1020,11 @@ const TAB_ICONS = {
   sync: tabSvg('<path d="M4 5h16a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1h-9l-5 4v-4H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Z"/>'),
   folders: tabSvg('<path d="M3 7a1 1 0 0 1 1-1h5l2 2h8a1 1 0 0 1 1 1v9a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1Z"/>'),
   apps: tabSvg('<circle cx="6" cy="6" r="1.4"/><circle cx="12" cy="6" r="1.4"/><circle cx="18" cy="6" r="1.4"/><circle cx="6" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="18" cy="12" r="1.4"/><circle cx="6" cy="18" r="1.4"/><circle cx="12" cy="18" r="1.4"/><circle cx="18" cy="18" r="1.4"/>'),
+  cards: tabSvg('<rect x="5" y="3" width="14" height="18" rx="1.5"/><path d="M8.5 8h7M8.5 12h7M8.5 16h4"/>'),
   usage: tabSvg('<path d="M4.5 17a8 8 0 1 1 15 0"/><path d="M12 15l4-5"/><circle cx="12" cy="15" r="1.2"/>'),
   ai: tabSvg('<path d="M14.5 5.5a4 4 0 0 0-5 5L4 16l2 2 5.5-5.5a4 4 0 0 0 5-5l-2.5 2.5-2-.5-.5-2Z"/>'),
 };
-const LIB_TABS = [['sync', '同步'], ['folders', '資料夾'], ['apps', 'App'], ['usage', '用量'], ['ai', '設定']];
+const LIB_TABS = [['sync', '同步'], ['folders', '資料夾'], ['apps', 'App'], ['cards', '知識卡'], ['usage', '用量'], ['ai', '設定']];
 
 function libPortalURL(a) {
   return 'https://' + a.host.replace('arcrun-cypher-executor.', 'arcrun-rag-ui.') + '/portal/';
@@ -1037,6 +1148,7 @@ function libBodyHtml(s, a, idx) {
   switch (libTabOf(idx)) {
     case 'folders': return tabFolders(s, a, idx);
     case 'apps': return tabApps(a, idx);
+    case 'cards': return tabCards(idx);
     case 'usage': return tabUsage(s, a);
     case 'ai': return tabAI(a);
     default: return tabSync(s, a);
@@ -1127,6 +1239,91 @@ function tabApps(a, idx) {
       </div>
     </div>
     `;
+}
+
+
+// ── 知識卡分頁（inkstone/arcrun-rag#333）：依帳號、庫、目錄瀏覽，點進去看整張卡 ──
+// 薄殼：資料全來自雲端既有的 /portal/data/map、library-cards、card，各帳號用自己已存的 session。
+// 只有點進去才問網路，不輪詢；畫面暫存只活在這個視窗的記憶體裡。
+// 還沒有的（雲端沒有對應能力）：卡上的「被問過幾次」、對卡片回覆「補充／內容不對」——見票。
+const kc = {};   // accIdx -> { view:'libs'|'cat'|'card', libs, lib, cat, card, busy }
+async function kcRun(idx, view, call, key) {
+  const cur = kc[idx] = Object.assign(kc[idx] || {}, { view, busy: true });
+  if (page === 'lib:' + idx) renderPage();
+  let res;
+  try { res = await call(); } catch (ex) { res = { error: errText(ex) }; }
+  cur[key] = res; cur.busy = false;
+  if (page === 'lib:' + idx) renderPage();
+}
+function kcLibs(idx) { return kcRun(idx, 'libs', () => go.ListCardLibraries(idx), 'libs'); }
+function kcCatalog(idx, lib) { (kc[idx] = kc[idx] || {}).lib = lib; return kcRun(idx, 'cat', () => go.ListLibraryCards(idx, lib), 'cat'); }
+function kcCard(idx, lib, name) { (kc[idx] = kc[idx] || {}).lib = lib; return kcRun(idx, 'card', () => go.GetLibraryCard(idx, lib, name), 'card'); }
+function kcBack(idx, to) {
+  const c = kc[idx];
+  // 從出處直接開卡進來時，上一層還沒載過：現問一次，不顯示空白
+  if (to === 'libs') { if (c.libs) { c.view = 'libs'; renderPage(); } else kcLibs(idx); }
+  else if (c.cat && c.cat.library === c.lib) { c.view = 'cat'; renderPage(); }
+  else kcCatalog(idx, c.lib);
+}
+function kcReload(idx) {
+  const c = kc[idx] || {};
+  if (c.view === 'card' && c.card) kcCard(idx, c.card.library, c.card.pageName);
+  else if (c.view === 'cat' && c.lib) kcCatalog(idx, c.lib);
+  else kcLibs(idx);
+}
+// 從首頁問答的出處點進來：直接開那張卡。
+function kcOpenFromChat(idx, lib, name) {
+  libTab[idx] = 'cards';
+  goPage('lib:' + idx);
+  kcCard(idx, lib, name);
+}
+async function kcLogin(btn) {
+  const idx = Number(btn.dataset.kclogin);
+  const pw = btn.closest('.chatlogin').querySelector('.chatpw');
+  btn.disabled = true;
+  try { await go.PortalLogin(idx, pw.value); kcReload(idx); }
+  catch (ex) {
+    btn.disabled = false;
+    const c = kc[idx]; const r = c && (c[c.view]);
+    if (r) { r.error = errText(ex); renderPage(); }
+  }
+}
+function kcLoginBox(idx, a, r) {
+  return `<div class="card"><div class="err" role="alert">${esc(r.error)}</div>
+    <div class="chatlogin"><span class="nm">${esc(a.name)}</span>
+      <input type="password" class="chatpw" placeholder="密碼" aria-label="${esc(a.name)} 的密碼"/>
+      <button data-kclogin="${idx}">登入</button></div></div>`;
+}
+function tabCards(idx) {
+  const a = (state.accounts || [])[idx] || { name: '' };
+  const c = kc[idx];
+  if (!c) return `<div class="card"><div class="d">…</div></div>`;
+  const cur = c[c.view];
+  if (c.busy && !cur) return `<div class="card"><div class="d">…</div></div>`;
+  if (!cur) return `<div class="card"><div class="d">…</div></div>`;
+  if (cur.needsLogin) return kcLoginBox(idx, a, cur);
+  if (cur.error) {
+    return `<div class="card">${more('看不到知識卡', esc(cur.error))}<div class="acts"><button id="kcRetry">重試</button></div></div>`;
+  }
+  if (c.view === 'libs') {
+    const L = cur.libraries || [];
+    if (!L.length) return `<div class="card"><div class="d one">${esc(cur.note || '還沒有知識庫')}</div></div>`;
+    return `<div class="kclist">${L.map((l) => `
+      <button class="kcrow" data-kclib="${esc(l.name)}"><span class="nm">${esc(l.name)}</span>${l.entries >= 0 ? `<span class="s">${l.entries}</span>` : ''}</button>`).join('')}</div>`;
+  }
+  if (c.view === 'cat') {
+    const cards = cur.cards || [];
+    return `<div class="kchead"><button class="icbtn plain" data-kcback="libs" title="回庫清單" aria-label="回庫清單">‹</button>
+        <span class="nm">${esc(cur.library)}</span><span class="s">${cur.total}</span></div>
+      <div class="kclist">${cards.map((x) => `
+        <button class="kcrow" data-kccard="${esc(x.pageName)}" data-kcl="${esc(cur.library)}">
+          <span class="nm">${esc(x.pageName)}</span>${x.gloss ? `<span class="d one">${esc(x.gloss)}</span>` : ''}</button>`).join('')}
+        ${cur.total > cards.length ? `<div class="d one">${cards.length}/${cur.total}</div>` : ''}</div>`;
+  }
+  return `<div class="kchead"><button class="icbtn plain" data-kcback="cat" title="回目錄" aria-label="回目錄">‹</button>
+      <span class="nm">${esc(cur.pageName)}</span></div>
+    <div class="card kccard">${(cur.blocks || []).map((b) => `<pre class="kcblock">${esc(b)}</pre>`).join('')}
+      ${cur.origin ? `<div class="d one" title="原文位置">${esc(cur.origin)}</div>` : ''}</div>`;
 }
 
 function tabUsage(s, a) {
@@ -1587,10 +1784,25 @@ function wire(root) {
   on('uDocs', () => go.OpenURL('https://rag.arcrun.dev/docs/'));
   on('uDiag', exportDiagnostics);
   on('fbSend', submitFeedback);
+  on('chatGo', askChat);
+  const cq = root.querySelector('#chatQ');
+  if (cq) {
+    cq.oninput = () => { chat.q = cq.value; };
+    cq.onkeydown = (e) => { if (e.key === 'Enter' && !e.isComposing) askChat(); };
+  }
+  all('[data-chatlogin]').forEach((b) => { b.onclick = () => chatLogin(b); });
+  all('[data-kcopen]').forEach((b) => {
+    b.onclick = () => { const p = b.dataset.kcopen.split('|'); kcOpenFromChat(Number(p[0]), p[1], p.slice(2).join('|')); };
+  });
+  all('[data-kclib]').forEach((b) => { b.onclick = () => kcCatalog(Number(page.slice(4)), b.dataset.kclib); });
+  all('[data-kccard]').forEach((b) => { b.onclick = () => kcCard(Number(page.slice(4)), b.dataset.kcl, b.dataset.kccard); });
+  all('[data-kcback]').forEach((b) => { b.onclick = () => kcBack(Number(page.slice(4)), b.dataset.kcback); });
+  all('[data-kclogin]').forEach((b) => { b.onclick = () => kcLogin(b); });
+  on('kcRetry', () => kcReload(Number(page.slice(4))));
   on('hLogs', () => go.OpenLogFolder());
   on('hLogs', () => go.OpenLogFolder());
   on('obConnect', showConnect);
-  on('obInstall', () => go.OpenURL('https://install.arcrun.dev/'));
+  on('obInstall', () => go.OpenURL(channelInfo.installUrl));
   on('obNext', () => { obStep = 2; renderPage(); });
   on('obBack', () => { obStep = 1; renderPage(); });
   on('uCheck', checkUpdate); on('uDownload', downloadUpdate); on('uApply', applyUpdate);
@@ -1605,16 +1817,37 @@ function wire(root) {
     };
   });
   all('[data-gohome]').forEach((b) => { b.onclick = () => goPage('home'); });
-  all('[data-stallall]').forEach((b) => {
+  all('[data-gopage]').forEach((b) => { b.onclick = () => goPage(b.dataset.gopage); });
+  // #330：「看內容」→ 顯示要寄出的完整內容 → 按鈕變「同意通報」→ 才寄。不同意就什麼都不寄。
+  all('[data-stallview]').forEach((b) => {
     b.onclick = async () => {
-      const fps = JSON.parse(b.dataset.stallall || '[]');
-      const msg = b.closest('.alertcard').querySelector('.stallmsg');
+      const fps = JSON.parse(b.dataset.stallview || '[]');
+      const card = b.closest('.alertcard');
+      const msg = card.querySelector('.stallmsg');
+      const pre = card.querySelector('[data-preview]');
       const account = ((state.accounts || [])[Number(b.dataset.accidx)] || {}).name || '';
+      if (!b.dataset.agree) {
+        b.disabled = true;
+        if (msg) msg.textContent = '…';
+        try {
+          const texts = [];
+          for (const fp of fps) texts.push(await go.StallPreview(fp));
+          pre.textContent = texts.join('\n\n');
+          pre.style.display = 'block';
+          b.dataset.agree = '1';
+          b.textContent = '同意通報';
+          if (msg) msg.textContent = '';
+        } catch (ex) {
+          if (msg) msg.innerHTML = `<details class="more"><summary>⚠ 讀不到</summary><div class="d one raw">${esc(Array.from(errText(ex)).slice(0, 20).join(''))}</div></details>`;
+        }
+        b.disabled = false;
+        return;
+      }
       b.disabled = true;
       if (msg) msg.textContent = '…';
       try {
-        for (const fp of fps) await go.ReportStall(fp);   // 回報＝已處理，卡片與紅點隨之消失
-        flashReported(account);                             // 但先留一行 ✓ 已回報 讓用戶看見
+        for (const fp of fps) await go.ReportStall(fp);   // 同意才寄；寄出後卡片變「已通報」
+        flashReported(account);
         await tick();
       } catch (ex) {
         const t = errText(ex);
@@ -1623,6 +1856,14 @@ function wire(root) {
         // 真的失敗只留一行 `⚠ 沒送出`＋「重試」，原因點開才看
         if (msg) msg.innerHTML = `<details class="more"><summary>⚠ 沒送出</summary><div class="d one raw">${esc(Array.from(t).slice(0, 20).join(''))}</div></details>`;
       }
+    };
+  });
+  all('[data-stalldecline]').forEach((b) => {
+    b.onclick = async () => {
+      const fps = JSON.parse(b.dataset.stalldecline || '[]');
+      b.disabled = true;
+      try { for (const fp of fps) await go.DeclineStall(fp); } catch (ex) { /* 記不下來就保留，下次再問 */ }
+      await tick();
     };
   });
   // × 關閉：記住鍵（重開 App 仍不亮），同一原因不再出現；份數變多不算新狀況
@@ -1875,7 +2116,7 @@ function showConnect() {
   openSheet(`
     <h2>連線</h2>
     <div class="field"><div class="lb">知識庫網址</div>
-      <input type="text" id="u" placeholder="https://arcrun-cypher-executor.xxxx.workers.dev"/></div>
+      <input type="text" id="u" value="${esc(channelInfo.defaultConnect || '')}" placeholder="https://arcrun-cypher-executor.xxxx.workers.dev"/></div>
     <div class="field"><div class="lb">Email</div>
       <input type="text" id="e" placeholder="you@example.com"/></div>
     <div class="field"><div class="lb">密碼</div><input type="password" id="p"/></div>

@@ -402,10 +402,10 @@ func cloudImageReader(client *http.Client, url, apiKey string) ImageReader {
 			return "", err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Arcrun-API-Key", apiKey)
+		SetCypherAuth(req, apiKey)
 		resp, err := client.Do(req)
 		if err != nil {
-			return "", fmt.Errorf("連不上你的知識庫：%w", err)
+			return "", cloudCallErr(err)
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))

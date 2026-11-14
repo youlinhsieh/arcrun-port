@@ -35,6 +35,9 @@ html, body { overflow: hidden; height: 100%; }
 #side .brand { display: flex; color: var(--ink); padding: 0 36px 16px; flex: none; background: none; border: none; border-radius: 0; cursor: pointer; }
 #side .brand:hover { background: none; }
 #side .brand img { width: 100%; height: auto; display: block; }
+/* 頻道標記（#135）：Stage 版在 logo 右上角掛一枚橘色小牌；正式版沒有 data-tag，這條不生效、畫面與以前相同。 */
+#side .brand[data-tag] { position: relative; }
+#side .brand[data-tag]::after { content: attr(data-tag); position: absolute; top: -4px; right: 30px; padding: 1px 7px; border-radius: 999px; background: #f57c00; color: #fff; font-size: 11px; font-weight: 700; letter-spacing: .04em; line-height: 16px; }
 #side .brand .wm-paper { display: none; }
 :root[data-theme="dark"] #side .brand .wm-ink { display: none; }
 :root[data-theme="dark"] #side .brand .wm-paper { display: block; }
@@ -768,6 +771,8 @@ main { padding: 22px 32px 28px; }
 .alertcard summary::after { right: 40px !important; }
 .alertcard .x { right: 10px; }
 .alertcard .x { z-index: 2; }
+/* #330：同意通報前給用戶看的「要寄出的完整內容」（資料，不是我們寫的字，可捲動） */
+.stallpreview { max-height: 220px; overflow: auto; margin: 8px 0 0; padding: 8px; font-size: 11px; line-height: 1.45; white-space: pre-wrap; word-break: break-all; background: var(--well2); border-radius: 6px; user-select: text; }
 
 .ugauge .bill { font-size: .85em; color: var(--amber); margin-left: 6px; white-space: nowrap; }
 
@@ -904,3 +909,23 @@ button.icbtn.plain:hover { background: var(--well); color: var(--ink); }
 .fterr.flash { animation: errflash 2.4s ease-out 1; }
 @keyframes errflash { 0%, 40% { background: rgba(var(--amber-rgb), .22); } 100% { background: transparent; } }
 .ftdone { color: rgba(var(--ink-rgb), .55); font-size: 13px; }
+
+/* ── 首頁問答框（#297）── */
+.chat { margin-bottom: 18px; }
+.chatrow { display: flex; gap: 8px; }
+.chatrow input[type=text] { flex: 1; min-width: 0; }
+.chatans { margin: 12px 0 8px; padding: 12px 14px; border-radius: 10px; background: var(--well); font: inherit; font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }
+.chatsrc { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.chatsrc .nm { font-size: 12px; padding: 3px 9px; border-radius: 12px; background: var(--well2); color: rgba(var(--ink-rgb), .7); }
+.chatsrc .nm.cited { color: var(--ink); }
+.chatlogin { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 13px; }
+.chatlogin input { flex: 1; min-width: 0; }
+
+.chatsrc button.nm { border: 0; cursor: pointer; font: inherit; font-size: 12px; }
+.kchead { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.kchead .nm { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kclist { display: flex; flex-direction: column; gap: 6px; }
+.kcrow { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; width: 100%; padding: 9px 12px; border: 0; border-radius: 10px; background: var(--well); color: var(--ink); font: inherit; cursor: pointer; }
+.kcrow:hover { background: var(--well2); }
+.kcrow .nm { font-size: 14px; }
+.kcblock { margin: 0 0 12px; font: inherit; font-size: 14px; line-height: 1.7; white-space: pre-wrap; word-break: break-word; }

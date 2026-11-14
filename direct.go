@@ -49,6 +49,15 @@ type AccountConfig struct {
 	CypherURL    string            `json:"cypher_url"`
 	Namespace    string            `json:"namespace"`
 	APIKey       string            `json:"api_key,omitempty"`
+	// KbdbKey＝打雲端要帶的 Bearer 憑證（inkstone/arcrun-rag#334）。連線精靈
+	// `POST /portal/daemon/config` 回的 `config.kbdb_key`；舊版精靈連的帳號沒有這欄
+	// （相容期內只帶租戶名照通，重新連線一次就補上）。見 cypherauth.go。
+	KbdbKey      string            `json:"kbdb_key,omitempty"`
+	// PortalSession／PortalSessionExp＝App 連線時存的 portal 登入憑證（arcrun-rag#137，session token 不是密碼）。
+	// cypher 直接接受它當 Bearer（Arcrun#399 c1794481882638068）。App 是唯一寫入者；
+	// 這裡鏡像只為了 collector 回寫 config 時不把它抹掉。
+	PortalSession    string `json:"portal_session,omitempty"`
+	PortalSessionExp int64  `json:"portal_session_exp,omitempty"`
 	WatchFolders []string          `json:"watch_folders,omitempty"` // 此帳號看守的資料夾（多根）
 	Libraries    map[string]string `json:"libraries,omitempty"`     // 資料夾→庫對映（t52）
 	// RetiringFolders＝使用者已經按下「移除並收回雲端資料」、但雲端還沒撤乾淨的資料夾
@@ -73,6 +82,7 @@ type DirectConfig struct {
 	CypherURL    string          `json:"cypher_url,omitempty"`    // 實例 cypher base（舊制；新制走 Accounts）
 	Namespace    string          `json:"namespace,omitempty"`     // 租戶 namespace（舊制；新制走 Accounts）
 	APIKey       string          `json:"api_key,omitempty"`       // X-Arcrun-API-Key（舊制）
+	KbdbKey      string          `json:"kbdb_key,omitempty"`      // Bearer 憑證（舊制；新制走 Accounts[].KbdbKey）
 	Email        string          `json:"email,omitempty"`         // 實例主身分（舊制）
 	InstanceName string          `json:"instance_name,omitempty"` // 暱稱（舊制）
 	Library      string          `json:"library"`                 // 藏書地圖歸庫鍵（空＝kb；per-folder 未指定時的後備）
@@ -89,6 +99,13 @@ type DirectConfig struct {
 	ExtractorExplicit bool    `json:"extractor_explicit,omitempty"`
 	ClaudeBin         string  `json:"claude_bin,omitempty"`           // claude 執行檔（空＝PATH 找 claude）
 	CardIngestWF      string  `json:"card_ingest_workflow,omitempty"` // 收卡 workflow（空＝rag_ingest_card）
+	// inkstone/arcrun-rag#296：敘述類原稿先切段進向量層、不先萃成卡（見 passages.go）。
+	// NarrativeRoute＝"passages"（新檔的敘述類走新路）／""或"cards"（與改版前一致，預設）。
+	// CriticalFolders＝被管理者宣告為關鍵的資料夾（絕對路徑或相對監看根），照舊預先編譯。
+	// PassageIngestWF＝收段落的 workflow 名（空＝rag_ingest_passages）。
+	NarrativeRoute  string   `json:"narrative_route,omitempty"`
+	CriticalFolders []string `json:"critical_folders,omitempty"`
+	PassageIngestWF string   `json:"passage_ingest_workflow,omitempty"`
 	PollSec           int     `json:"poll_interval_sec"`              // 輪詢間隔秒（空/0＝5）
 	MaxRemoved        float64 `json:"max_removed_ratio"`              // 大量刪除防呆門檻（空/0＝0.4）
 	// MaxEventsPerRun（2026-08-07 pacing task）：單輪最多處理幾個 added/modified/renamed/
@@ -257,6 +274,7 @@ func LoadDirectConfig(path string) (*DirectConfig, error) {
 			CypherURL:    c.CypherURL,
 			Namespace:    c.Namespace,
 			APIKey:       c.APIKey,
+			KbdbKey:      c.KbdbKey,
 			Libraries:    c.Libraries,
 			WatchFolders: c.Folders(), // 正規化後的監看清單
 			// arcrun-rag#46：待撤清單也要一起遷過來。漏掉這裡＝舊制使用者的
@@ -372,6 +390,7 @@ func LoadDirectConfig(path string) (*DirectConfig, error) {
 	if c.CypherURL != "" {
 		c.CypherURL = strings.TrimSuffix(c.CypherURL, "/")
 	}
+	registerAccountKeys(&c) // #334：打雲端帶 Bearer 憑證（見 cypherauth.go）
 	return &c, nil
 }
 
@@ -552,7 +571,7 @@ func (c *DirectConfig) postJSONAs(step callStep, url string, body any, retry boo
 		return 0, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Arcrun-API-Key", c.APIKey)
+	SetCypherAuth(req, c.APIKey)
 	resp, err := directHTTP.Do(req)
 	if err != nil {
 		// 公眾 Wi-Fi 的登入頁攔 HTTPS 時憑證對不上 ⇒ 講成人話（captiveportal.go），且不算雲端的錯。
@@ -690,6 +709,7 @@ func (c *DirectConfig) makeAccountSubConfig(acc AccountConfig) *DirectConfig {
 	if sub.APIKey == "" {
 		sub.APIKey = sub.Namespace
 	}
+	sub.KbdbKey = acc.KbdbKey
 	sub.Email = acc.Email
 	sub.InstanceName = acc.InstanceName
 	sub.WatchFolder = ""
@@ -792,6 +812,7 @@ func RunDirectOnce(cfg *DirectConfig, dryRun bool) ([]DirectResult, int, *Trigge
 			CypherURL:    cfg.CypherURL,
 			Namespace:    cfg.Namespace,
 			APIKey:       cfg.APIKey,
+			KbdbKey:      cfg.KbdbKey,
 			Libraries:    cfg.Libraries,
 			WatchFolders: cfg.Folders(),
 			// arcrun-rag#46：舊制（單帳號、頂層欄位）的待撤資料夾也要帶進來，
@@ -1546,6 +1567,12 @@ func drainPendingTakedowns(
 			"machine_label": mach.Label,
 		})
 		res.HTTPStatus = status
+		if perr == nil {
+			// #296：走過向量層新路的檔，段落另外刪（卡片那條撤除對它們是零命中）。
+			if n := m.PendingPassageTrims[oldPath]; n > 0 {
+				perr = cfg.trimPassages(cfg.passagePoster(step, oldPath, false), oldPath, pageName, cfg.libraryFor(absRoot), mach.ID, mach.Label, n)
+			}
+		}
 		if perr != nil {
 			res.Status, res.Error = "failed", failPrefix+perr.Error()
 			exit = 1
@@ -1624,7 +1651,7 @@ func retireRootOnce(cfg *DirectConfig, root string, dryRun bool) (
 	if len(m.Entries) > 0 && !dryRun {
 		for path, e := range m.Entries {
 			if e != nil && strings.TrimSpace(e.IngestedHash) != "" {
-				m.QueueTakedown(path, pageNameOf(path))
+				m.QueueTakedownOf(path, pageNameOf(path), e)
 			}
 		}
 		m.Entries = map[string]*ManifestEntry{}
@@ -1635,7 +1662,7 @@ func retireRootOnce(cfg *DirectConfig, root string, dryRun bool) (
 	} else if dryRun {
 		for path, e := range m.Entries {
 			if e != nil && strings.TrimSpace(e.IngestedHash) != "" {
-				m.QueueTakedown(path, pageNameOf(path))
+				m.QueueTakedownOf(path, pageNameOf(path), e)
 			}
 		}
 	}
@@ -1869,6 +1896,24 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 		saveManifest()
 	}
 
+	// 🔴 遮蔽規則升版 ⇒ 既有卡片就地重掃（inkstone/arcrun-rag#294）——升版才跑、掃完蓋章、零 LLM。
+	// 原檔內容沒變小幫手不會重萃，舊規則放過去的卡就永遠帶著原值；見 secretrescan.go。
+	if rr := rescanSecretsUnlessSaving(cfg, absRoot, m, dryRun, runNow); rr != nil {
+		if rr.Redacted > 0 {
+			results = append(results, DirectResult{
+				Type: "resync", Path: absRoot, Status: "noticed",
+				Error: fmt.Sprintf("已把 %d 份筆記裡的機敏值（%d 處，%s）換成指標，雲端也已更新；要看原值請開原檔", rr.Redacted, rr.Count, strings.Join(rr.Labels, "、")),
+			})
+		}
+		if rr.Err != "" {
+			results = append(results, DirectResult{
+				Type: "resync", Path: absRoot, Status: "noticed",
+				Error: "遮蔽舊筆記裡的機敏值時有一份沒成功（不影響同步，稍後自動再試）：" + rr.Err,
+			})
+		}
+		saveManifest()
+	}
+
 	// 2026-08-07 task 3：Scan() 會把 removed 的路徑從 m.Entries 整批拿掉（rebuild 語意，
 	// 見 scan.go 步驟 7）——但那只是「偵測到不見了」，不代表下架 POST 已經成功。
 	// 沒有這份快照的話，本輪只要有任何一個 added/modified 事件先觸發了下面的
@@ -1939,8 +1984,8 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 	// ——build 之後、Publish 與 sync 之前——所以**本機快照與上雲酬載必然是同一份身分**。
 	// 卡片那條路（folderindex／inventory／sourcerepair）用的是同一個 cfg.machineIdentity()，
 	// 同一輪只解析一次，兩條路送上去的值必然相同。
-	tree := BuildFolderTree(absRoot, cfg.libraryFor(absRoot), payload.DirStats, m.Entries,
-		payload.AllExcludedDirs, plan, runNow).StampMachine(cfg.machineIdentity()).StampDaemonVersion(daemonVersion()).StampLedger(m.Entries, runNow)
+	tree := cfg.stampLedger(BuildFolderTree(absRoot, cfg.libraryFor(absRoot), payload.DirStats, m.Entries,
+		payload.AllExcludedDirs, plan, runNow).StampMachine(cfg.machineIdentity()).StampDaemonVersion(daemonVersion()), m.Entries, runNow)
 	if !dryRun {
 		PublishFolderTreeNow(cfg.Manifest, root, tree, runNow)
 	}
@@ -1978,8 +2023,8 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 				}
 			}
 		}
-		latestTree = BuildFolderTree(absRoot, cfg.libraryFor(absRoot), payload.DirStats, entries,
-			payload.AllExcludedDirs, plan, runNow).StampMachine(cfg.machineIdentity()).StampDaemonVersion(daemonVersion()).StampLedger(entries, runNow)
+		latestTree = cfg.stampLedger(BuildFolderTree(absRoot, cfg.libraryFor(absRoot), payload.DirStats, entries,
+			payload.AllExcludedDirs, plan, runNow).StampMachine(cfg.machineIdentity()).StampDaemonVersion(daemonVersion()), entries, runNow)
 		PublishFolderTreeNow(cfg.Manifest, root, latestTree, runNow)
 		cfg.guard.fileFinished(root, outcome, m.Progress())
 	}
@@ -2047,7 +2092,7 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 	// 上限（perRunCap）把它排除在外、或這輪下架失敗時就會永久遺失這個待辦。
 	for _, ev := range payload.Events {
 		if ev.Type == "renamed" && ev.OldPath != "" {
-			m.QueueTakedown(ev.OldPath, pageNameOf(ev.OldPath))
+			m.QueueTakedownOf(ev.OldPath, pageNameOf(ev.OldPath), preScanEntries[ev.OldPath])
 		}
 	}
 	if len(m.PendingTakedowns) > 0 && !dryRun {
@@ -2226,6 +2271,60 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 			out = append(out, res)
 			return
 		}
+		// 🔴 inkstone/arcrun-rag#296：敘述類的新檔先切段進向量層、不萃卡（passages.go）。
+		// 放在「同內容併卡」之前：走新路的檔沒有卡，不參與 twin 的本尊／雙胞胎記帳。
+		if cfg.Extractor != "" {
+			if ok, _ := cfg.passageRouteFor(absRoot, ev.Path, m.Entries[ev.Path]); ok {
+				if handled := func() bool {
+					ownFail := m.HasOwnFailure(ev.Path)
+					prevCount := 0
+					if e := m.Entries[ev.Path]; e != nil && e.PassageMode {
+						prevCount = e.PassageCount
+					}
+					stateMu.Unlock()
+					paceGate.Lock()
+					paceFor(cfg)
+					paceGate.Unlock()
+					n, kind, perr := cfg.ingestPassagesOf(stepIngestPassages.on(ev.Path), absRoot, ev.Path, content, ev.SourceHash, prevCount, ownFail)
+					stateMu.Lock()
+					if kind == docKindTable {
+						return false // 內文大半是表格：回到舊路，照舊預先編譯
+					}
+					if perr != nil {
+						if isQuotaExhausted(perr.Error()) || isStallError(perr) || strings.Contains(perr.Error(), "429") {
+							lane.pressure()
+						}
+						if isRouteBackoff(perr) || isLocalNetworkErr(perr) {
+							res.Status = "skipped"
+							res.Error = perr.Error()
+							if isLocalNetworkErr(perr) {
+								res.Error = networkDownNote(cfg, perr)
+								m.MarkNetworkUnavailable(ev.Path, now, perr.Error())
+							}
+						} else {
+							res.Status, res.Error = "failed", perr.Error()
+							res.Detail = upstreamDetail(perr)
+							m.MarkFailed(ev.Path, now, failureWithUpstream(res.Error, res.Detail))
+							exit = 1
+						}
+						saveManifest()
+						liveReport(res.Status)
+						out = append(out, res)
+						return true
+					}
+					res.Status = "ingested"
+					lane.good()
+					m.MarkPassagesIngested(ev.Path, ev.SourceHash, now, n)
+					qs.DailyCount++
+					saveManifest()
+					liveReport(res.Status)
+					out = append(out, res)
+					return true
+				}(); handled {
+					return
+				}
+			}
+		}
 		// 🔴 同內容的檔只萃一張卡（inkstone/arcrun-rag#246 c18722／c18734，細節見 contenttwin.go）：
 		// 內容（hash）和別份已上雲的檔一模一樣 ⇒ 不萃、不上雲，只在那張卡的「### 出處」多寫一行。
 		// 撞名不是用戶的錯，也不是錯誤：hash 一樣擇一並指向它，hash 不一樣就各自一張卡（wikishape 消歧）。
@@ -2403,6 +2502,13 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 				// 硬缺（H1/H2/H5）＝拒收、不 POST、標 failed（manifest 不回寫＝下輪重萃自癒）；
 				// 軟項（H3/H4/H6）＝照送但帶 quality:low＋quality_warnings（裁決 T4-C）。
 				// #251 c18987：個人證號（身分證／卡號）機器自己改寫成描述，不當成失敗；金鑰類照舊硬擋。
+				// #294：卡上若還帶機敏值（逐字表、讀圖原文、模型回聲），換成指標、不擋；原值不寫回、不記錄。
+				if red, srep := redactSecretText(string(cardData), false); srep.Count > 0 {
+					if werr := os.WriteFile(filepath.Join(absRoot, filepath.FromSlash(cardRel)), []byte(red), 0o644); werr == nil {
+						cardData = []byte(red)
+					}
+					cardData = []byte(red) // 寫回失敗也只送遮過的版本
+				}
 				if red, nred := redactPersonalIDs(string(cardData)); nred > 0 {
 					if werr := os.WriteFile(filepath.Join(absRoot, filepath.FromSlash(cardRel)), []byte(red), 0o644); werr == nil {
 						cardData = []byte(red)
@@ -2463,13 +2569,17 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 				// （細節與量測見 cardslice.go）。一段一發，**最後一段先送、第一段最後送**。
 				var status int
 				var perr error
-				for _, sl := range planCardSlices(string(cardData), cardIdx, pageName, cloudHasSlicedNotes(cfg.CloudVersion)) {
+				slices := planCardSlices(string(cardData), cardIdx, pageName, cloudHasSlicedNotes(cfg.CloudVersion))
+				for si, sl := range slices {
 					body := sl.body(cardBody)
 					stateMu.Unlock() // #297：同上，等雲端時不握鎖
 					status, _, perr = cfg.postJSONAs(stepIngestCard.on(ev.Path), cfg.triggerURL(cfg.CardIngestWF), body,
 						ownFailPost)
 					stateMu.Lock()
 					if perr != nil {
+						// #293：哪一段失敗要看得到。第一段（offset 0）連 block 都在它身上，
+						// 它是不是那個「每次都超時」的段，只有帳本上寫出來才分辨得開。
+						perr = sliceTagged(perr, si+1, len(slices), sl)
 						break
 					}
 				}
@@ -2586,6 +2696,29 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 		res := DirectResult{Type: ev.Type, Path: ev.Path}
 		if dryRun {
 			res.Status = "planned"
+			out = append(out, res)
+			return
+		}
+		// #296：走過向量層新路的檔——沒有卡，下架＝把它的段落刪掉。
+		if e := m.Entries[ev.Path]; e != nil && e.PassageMode {
+			if note := cfg.routeNote(cfg.triggerURL(cfg.passageWF())); note != "" {
+				res.Status, res.Error = "skipped", note
+				out = append(out, res)
+				return
+			}
+			paceFor(cfg)
+			mach := cfg.machineIdentity()
+			if perr := cfg.trimPassages(cfg.passagePoster(stepTakedown, ev.Path, false), ev.Path, pageNameOf(ev.Path),
+				cfg.libraryFor(absRoot), mach.ID, mach.Label, e.PassageCount); perr != nil {
+				res.Status, res.Error = "failed", perr.Error()
+				exit = 1
+				out = append(out, res)
+				return
+			}
+			res.Status = "removed"
+			delete(m.Entries, ev.Path)
+			saveManifest()
+			liveReport("removed")
 			out = append(out, res)
 			return
 		}
@@ -2770,6 +2903,20 @@ func runDirectOnceRoot(cfg *DirectConfig, root string, dryRun bool, qs *quotaSta
 	// 放在萃取迴圈**之後**：目錄只列「已經上雲的文件」，這輪剛送的卡要同一輪就進目錄。
 	// 失敗記進 manifest.wiki_index_fails（畫面 !N、退避到點自動重送），不安靜跳過；
 	// 不受「有事件才做」的閘限制——靜止時雜湊擋重送，失敗的卡靠這裡到點重試。
+	// 讀者欄收件匣（wikireader.go）：先併進帳本，這一輪的目錄卡就帶上讀者欄。
+	if !dryRun {
+		if rep, err := mergeReaderInbox(absRoot); err != nil {
+			results = append(results, DirectResult{Type: "reader", Status: "failed", Error: "讀者欄併入帳本失敗（收件匣的檔留著，下一輪重試）：" + err.Error()})
+		} else if rep != nil {
+			st := "ingested"
+			if len(rep.Errors) > 0 {
+				st = "failed"
+			}
+			results = append(results, DirectResult{Type: "reader", Status: st, Error: fmt.Sprintf(
+				"讀者欄：併入 %d、未變 %d、原稿已改丟棄 %d、帳本沒有 %d、格式壞 %d%s",
+				rep.Merged, rep.Unchanged, rep.Stale, rep.Missing, rep.Bad, strings.Join(append([]string{""}, rep.Errors...), "；"))})
+		}
+	}
 	if ixRes := syncWikiIndexCards(cfg, absRoot, m, dryRun, runNow); len(ixRes) > 0 {
 		results = append(results, ixRes...)
 	}
@@ -2986,4 +3133,26 @@ func healAccountKeyCrossover(accs []AccountConfig) bool {
 		}
 	}
 	return changed
+}
+
+// sliceErr＝在原錯誤後面補上「第幾發／共幾發、從第幾條關係起」。
+// 刻意附在**後面**並保留 Unwrap：既有的錯誤分類（isStallError／isLocalNetworkErr／
+// 以訊息開頭比對的那些）都照舊認得，只是帳本上多一截線索（inkstone/arcrun-rag#293）。
+type sliceErr struct {
+	err      error
+	n, total int
+	offset   int
+	scope    string
+}
+
+func (e *sliceErr) Error() string {
+	return fmt.Sprintf("%s｜送卡第 %d／%d 發（關係從第 %d 條起，scope=%q）", e.err.Error(), e.n, e.total, e.offset, e.scope)
+}
+func (e *sliceErr) Unwrap() error { return e.err }
+
+func sliceTagged(err error, n, total int, sl cardSlice) error {
+	if err == nil || total <= 1 {
+		return err
+	}
+	return &sliceErr{err: err, n: n, total: total, offset: sl.Offset, scope: sl.Scope}
 }

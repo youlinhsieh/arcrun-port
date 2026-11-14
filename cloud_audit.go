@@ -172,7 +172,7 @@ func (e kbdbEntryStatus) deprecated() bool {
 func fetchCardBlocks(cfg *DirectConfig, base, library, relPath string, offset int) (entries []kbdbEntryStatus, total int, err error) {
 	q := url.Values{}
 	q.Set("source", "kb://"+relPath+"#0")
-	q.Set("entry_type", "block")
+	q.Set("template", "block")
 	q.Set("limit", fmt.Sprint(cloudAuditPageSize))
 	q.Set("offset", fmt.Sprint(offset))
 	if strings.TrimSpace(library) != "" {
@@ -191,7 +191,7 @@ func fetchCardBlocks(cfg *DirectConfig, base, library, relPath string, offset in
 		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("X-Arcrun-API-Key", cfg.APIKey)
+	SetCypherAuth(req, cfg.APIKey)
 	resp, err := cloudAuditHTTP.Do(req)
 	if err != nil {
 		return nil, 0, gate.record(err)
